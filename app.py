@@ -3,19 +3,65 @@ from datetime import datetime, date
 import pandas as pd
 import streamlit as st
 
-from modules import db
-from modules.utils import compute_profit_metrics, compute_vat, peso, ymd
-from modules import invoice as inv
-from modules import auth  # NEW
-
-from modules import gdrive
-
 st.set_page_config(page_title="TakeOut Restaurant Management System", layout="wide")
 
-# Init DB (+ ensure admin)
+# --- Local modules ---
+from modules import auth
+from modules import db
+from modules import invoice as inv
+from modules.utils import compute_profit_metrics, compute_vat, peso, ymd
+
+# -------------------- Config & Secrets --------------------
+DB_FILE = os.environ.get("TAKEOUT_DB_PATH", "takeout.db")
+
+def has_drive_secrets() -> bool:
+    try:
+        return (
+            "gdrive" in st.secrets
+            and "folder_id" in st.secrets["gdrive"]
+            and "gdrive_service_account" in st.secrets
+            and "client_email" in st.secrets["gdrive_service_account"]
+            and "private_key" in st.secrets["gdrive_service_account"]
+        )
+    except Exception:
+        return False
+
+# -------------------- (Optional) Google Drive Sync FIRST --------------------
+# Do this BEFORE any DB connections or init to avoid Windows file lock issues.
+if has_drive_secrets():
+    from modules import gdrive
+    from modules import sync
+
+    try:
+        ok, info = gdrive.probe_folder(st.secrets["gdrive"]["folder_id"])
+    except Exception as e:
+        ok, info = False, f"Probe failed: {e}"
+
+    if not ok:
+        st.sidebar.warning(f"Drive folder not accessible: {info}")
+        drive_ready = False
+    else:
+        try:
+            res = sync.newest_wins_sync(DB_FILE, st.secrets["gdrive"]["folder_id"])
+            drive_ready = True
+            msg = res.get("action", "noop")
+            if msg == "download":
+                st.sidebar.success("DB updated from Drive (remote newer).")
+            elif msg == "upload":
+                st.sidebar.info("DB pushed to Drive (local newer).")
+            else:
+                st.sidebar.caption("DB in sync with Drive.")
+        except Exception as e:
+            drive_ready = False
+            st.sidebar.warning(f"Drive sync skipped (error): {e}")
+else:
+    st.sidebar.caption("Drive sync disabled (no secrets).")
+    drive_ready = False
+
+# -------------------- DB Init AFTER sync --------------------
 db.init_db()
 
-# --- Auth helpers ---
+# -------------------- Auth helpers --------------------
 ROLE_LEVEL = auth.ROLE_LEVEL
 PAGES = [
     "Dashboard",
@@ -105,13 +151,12 @@ def login_block():
 def product_options():
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, name, item_code FROM products WHERE status!='Archived' ORDER BY name"
+            "SELECT id, name, item_code FROM products WHERE status!='Archived' OR status IS NULL ORDER BY name"
         ).fetchall()
         return {f"{r['name']} ({r['item_code'] or '—'})": r["id"] for r in rows}
 
-# --- Sidebar ---
+# -------------------- Sidebar --------------------
 st.sidebar.title("🍳 TakeOut RMS")
-
 user = current_user()
 if user:
     st.sidebar.success(f"Logged in as **{user['username']}** ({user['role']})")
@@ -121,17 +166,20 @@ if user:
 else:
     st.sidebar.info("Not logged in")
 
-# Navigation (show based on role)
-allowed_pages = [p for p in PAGES if (user and ROLE_LEVEL[user["role"]] >= ROLE_LEVEL[REQUIRES[p]]) or p in ["Dashboard","Sales Reports","Expense Reports","Financial Statements","Profile"]]
+# Navigation (viewer-level pages always visible when logged out)
+viewer_defaults = {"Dashboard", "Sales Reports", "Expense Reports", "Financial Statements", "Profile"}
+allowed_pages = sorted(
+    p for p in PAGES
+    if (user and ROLE_LEVEL[user["role"]] >= ROLE_LEVEL[REQUIRES[p]]) or p in viewer_defaults
+)
 page = st.sidebar.radio("Go to", allowed_pages, index=0)
 
 # If not logged and page needs auth, show login/registration instead
 ok, msg = require_role(page)
 if not ok:
     st.warning(msg)
-    login_block()          # show the login/register UI
-    st.stop()              # ✅ halt the rest of the script this run
-
+    login_block()
+    st.stop()
 
 # -------------------- Dashboard --------------------
 if page == "Dashboard":
@@ -242,36 +290,39 @@ if page == "Products & Pricing":
 
             submitted = st.form_submit_button("Save Product")
             if submitted:
-                if pid_to_update:
-                    conn.execute(
-                        """
-                        UPDATE products
-                           SET name=?, item_code=?, discount=?, item_cost=?, tax_amount=?, other_costs=?,
-                               total_cost=?, selling_price=?, est_profit=?, profit_margin=?, notes=?
-                         WHERE id=?
-                        """,
-                        (
-                            name, item_code, discount, item_cost, tax_amount, other_costs,
-                            m["total_cost"], selling_price, m["est_profit"], m["profit_margin"],
-                            notes, pid_to_update,
-                        ),
-                    )
-                    st.success("Product updated.")
+                if not name or not item_code:
+                    st.error("Name and Item Code are required.")
                 else:
-                    conn.execute(
-                        """
-                        INSERT INTO products
-                          (name, item_code, discount, item_cost, tax_amount, other_costs,
-                           total_cost, selling_price, est_profit, profit_margin, notes)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                        """,
-                        (
-                            name, item_code, discount, item_cost, tax_amount, other_costs,
-                            m["total_cost"], selling_price, m["est_profit"], m["profit_margin"],
-                            notes,
-                        ),
-                    )
-                    st.success("Product added.")
+                    if pid_to_update:
+                        conn.execute(
+                            """
+                            UPDATE products
+                               SET name=?, item_code=?, discount=?, item_cost=?, tax_amount=?, other_costs=?,
+                                   total_cost=?, selling_price=?, est_profit=?, profit_margin=?, notes=?
+                             WHERE id=?
+                            """,
+                            (
+                                name, item_code, discount, item_cost, tax_amount, other_costs,
+                                m["total_cost"], selling_price, m["est_profit"], m["profit_margin"], notes,
+                                pid_to_update,
+                            ),
+                        )
+                        st.success("Product updated.")
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO products
+                              (name, item_code, discount, item_cost, tax_amount, other_costs,
+                               total_cost, selling_price, est_profit, profit_margin, notes)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                            """,
+                            (
+                                name, item_code, discount, item_cost, tax_amount, other_costs,
+                                m["total_cost"], selling_price, m["est_profit"], m["profit_margin"], notes,
+                            ),
+                        )
+                        st.success("Product added.")
+                    st.rerun()
 
         st.markdown("---")
         df = pd.read_sql_query("SELECT * FROM products ORDER BY name", conn)
@@ -287,7 +338,8 @@ if page == "Products & Pricing":
             del_id = st.selectbox("Delete Product ID", options=[None] + df["id"].tolist())
             if st.button("Delete Selected Product") and del_id:
                 conn.execute("DELETE FROM products WHERE id=?", (int(del_id),))
-                st.warning("Product deleted. Refresh to see changes.")
+                st.warning("Product deleted.")
+                st.rerun()
 
 # -------------------- Inventory --------------------
 if page == "Inventory":
@@ -310,7 +362,7 @@ if page == "Inventory":
                     (ts, product_id, int(qty), status, notes),
                 )
                 row = conn.execute("SELECT * FROM inventory WHERE product_id=?", (product_id,)).fetchone()
-                price = conn.execute("SELECT selling_price FROM products WHERE id=?", (product_id,)).fetchone()["selling_price"] or 0.0
+                price = (conn.execute("SELECT selling_price FROM products WHERE id=?", (product_id,)).fetchone() or {}).get("selling_price", 0.0) or 0.0
                 if row:
                     new_avail = (row["available_stock"] or 0) + int(qty)
                     conn.execute(
@@ -318,10 +370,11 @@ if page == "Inventory":
                         UPDATE inventory
                            SET available_stock=?,
                                all_time_stock_in=COALESCE(all_time_stock_in,0)+?,
-                               current_inventory_value=?
+                               current_inventory_value=?,
+                               status=CASE WHEN ? > 0 THEN 'In Stock' ELSE 'Out of Stock' END
                          WHERE product_id=?
                         """,
-                        (new_avail, int(qty), new_avail * price, product_id),
+                        (new_avail, int(qty), new_avail * price, new_avail, product_id),
                     )
                 else:
                     conn.execute(
@@ -332,6 +385,7 @@ if page == "Inventory":
                         (product_id, int(qty), 0, "In Stock", int(qty) * price, int(qty), 0, 0.0),
                     )
                 st.success("Stock in recorded.")
+                st.rerun()
 
         st.markdown("---")
         st.subheader("Stock-in Logs")
@@ -371,9 +425,9 @@ if page == "Inventory":
             low_stock = (inv_df["Available Stock"] <= inv_df["Low Stock Alert"]).sum()
             out_of_stock = (inv_df["Available Stock"] <= 0).sum()
             c1, c2, c3 = st.columns(3)
-            c1.metric("In Stock", in_stock)
-            c2.metric("Low Stock", low_stock)
-            c3.metric("Out of Stock", out_of_stock)
+            c1.metric("In Stock", int(in_stock))
+            c2.metric("Low Stock", int(low_stock))
+            c3.metric("Out of Stock", int(out_of_stock))
 
 # -------------------- Sales & Invoicing --------------------
 if page == "Sales & Invoicing":
@@ -408,39 +462,29 @@ if page == "Sales & Invoicing":
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        ymd(billing_date),
-                        product_id,
-                        int(qty),
-                        item_price,
-                        discount,
-                        line_total_gross,
-                        payment_status,
-                        sales_channel,
-                        customer_name,
-                        customer_tin,
-                        business_address,
-                        notes,
-                        1 if vat_incl else 0,
-                        vat_amt,
-                        net_of_vat,
+                        ymd(billing_date), product_id, int(qty), item_price, discount, line_total_gross,
+                        payment_status, sales_channel, customer_name, customer_tin, business_address,
+                        notes, 1 if vat_incl else 0, vat_amt, net_of_vat,
                     ),
                 )
                 inv_row = conn.execute("SELECT * FROM inventory WHERE product_id=?", (product_id,)).fetchone()
-                price = conn.execute("SELECT selling_price FROM products WHERE id=?", (product_id,)).fetchone()["selling_price"] or 0.0
+                price = (conn.execute("SELECT selling_price FROM products WHERE id=?", (product_id,)).fetchone() or {}).get("selling_price", 0.0) or 0.0
                 if inv_row:
-                    new_avail = (inv_row["available_stock"] or 0) - int(qty)
+                    new_avail = max((inv_row["available_stock"] or 0) - int(qty), 0)
                     conn.execute(
                         """
                         UPDATE inventory
                            SET available_stock=?,
                                all_time_stock_out=COALESCE(all_time_stock_out,0)+?,
                                all_time_sales=COALESCE(all_time_sales,0)+?,
-                               current_inventory_value=?
+                               current_inventory_value=?,
+                               status=CASE WHEN ? > 0 THEN 'In Stock' ELSE 'Out of Stock' END
                          WHERE product_id=?
                         """,
-                        (new_avail, int(qty), line_total_gross, max(new_avail, 0) * price, product_id),
+                        (new_avail, int(qty), line_total_gross, new_avail * price, new_avail, product_id),
                     )
                 st.success("Sale recorded.")
+                st.rerun()
 
     st.markdown("---")
     with db.get_conn() as conn:
@@ -463,7 +507,7 @@ if page == "Sales & Invoicing":
     st.dataframe(sales_df, use_container_width=True)
 
     st.subheader("Invoice Generator")
-    inv_id = st.selectbox("Select Sale ID for Invoice", options=[None] + sales_df["id"].tolist())
+    inv_id = st.selectbox("Select Sale ID for Invoice", options=[None] + sales_df["id"].tolist() if not sales_df.empty else [None])
     if st.button("Generate Invoice HTML") and inv_id:
         with db.get_conn() as conn:
             row = conn.execute(
@@ -475,48 +519,53 @@ if page == "Sales & Invoicing":
                 """,
                 (int(inv_id),),
             ).fetchone()
-        invoice_no = row["invoice_no"] or f"INV-{row['id']:06d}"
-        if not row["invoice_no"]:
-            with db.get_conn() as conn:
-                conn.execute("UPDATE sales SET invoice_no=? WHERE id=?", (invoice_no, int(inv_id)))
+        if not row:
+            st.error("Sale not found.")
+        else:
+            invoice_no = row["invoice_no"] or f"INV-{row['id']:06d}"
+            if not row["invoice_no"]:
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE sales SET invoice_no=? WHERE id=?", (invoice_no, int(inv_id)))
 
-        rows = [
-            {
+            rows = [{
                 "product_name": row["product_name"],
                 "quantity": row["quantity"],
                 "item_price": row["item_price"],
                 "discount": row["discount"],
                 "line_total": row["total_amount"],
-            }
-        ]
-        subtotal = row["net_of_vat"] if row["vat_inclusive"] == 1 else (row["total_amount"])
-        vat = row["vat_amount"]
-        grand_total = row["total_amount"] if row["vat_inclusive"] == 1 else (row["total_amount"] + row["vat_amount"])
+            }]
+            subtotal = row["net_of_vat"] if row["vat_inclusive"] == 1 else row["total_amount"]
+            vat = row["vat_amount"]
+            grand_total = row["total_amount"] if row["vat_inclusive"] == 1 else (row["total_amount"] + row["vat_amount"])
 
-        html = inv.render_invoice_html(
-            invoice_no=invoice_no,
-            billing_date=row["billing_date"],
-            customer_name=row["customer_name"],
-            customer_tin=row["customer_tin"],
-            business_address=row["business_address"],
-            rows=rows,
-            subtotal=subtotal,
-            vat=vat,
-            grand_total=grand_total,
-        )
-        out_dir = "invoices"
-        os.makedirs(out_dir, exist_ok=True)
-        file_path = os.path.join(out_dir, f"{invoice_no}.html")
-        inv.save_invoice_html(file_path, html)
-        try:
-            fid = gdrive.upload_file(file_path, st.secrets["gdrive"]["folder_id"])
-            st.info(f"Invoice uploaded to Drive (file id: {fid})")
-        except Exception as e:
-            st.warning(f"Drive upload skipped: {e}")
-                
-        st.success(f"Invoice generated: {file_path}")
-        with open(file_path, "rb") as f:
-            st.download_button("Download Invoice HTML", f, file_name=f"{invoice_no}.html", mime="text/html")
+            html = inv.render_invoice_html(
+                invoice_no=invoice_no,
+                billing_date=row["billing_date"],
+                customer_name=row["customer_name"],
+                customer_tin=row["customer_tin"],
+                business_address=row["business_address"],
+                rows=rows,
+                subtotal=subtotal,
+                vat=vat,
+                grand_total=grand_total,
+            )
+            out_dir = "invoices"
+            os.makedirs(out_dir, exist_ok=True)
+            file_path = os.path.join(out_dir, f"{invoice_no}.html")
+            inv.save_invoice_html(file_path, html)
+
+            # Optional upload to Drive (only if configured)
+            if has_drive_secrets():
+                try:
+                    from modules import gdrive
+                    fid = gdrive.upload_file(file_path, st.secrets["gdrive"]["folder_id"])
+                    st.info(f"Invoice uploaded to Drive (file id: {fid})")
+                except Exception as e:
+                    st.warning(f"Drive upload skipped: {e}")
+
+            st.success(f"Invoice generated: {file_path}")
+            with open(file_path, "rb") as f:
+                st.download_button("Download Invoice HTML", f, file_name=f"{invoice_no}.html", mime="text/html")
 
 # -------------------- Expenses --------------------
 if page == "Expenses":
@@ -543,6 +592,7 @@ if page == "Expenses":
                     (ymd(purchase_date), category, description, total_cost, status, receipt_no, vendor_name, vendor_tin, business_address, notes),
                 )
                 st.success("Expense saved.")
+                st.rerun()
 
         st.markdown("---")
         df = pd.read_sql_query("SELECT * FROM expenses ORDER BY purchase_date DESC, id DESC", conn)
@@ -572,6 +622,7 @@ if page == "Supplies":
                     (item_description, supplier, units_per_piece, unit_symbol, item_cost, ymd(datetime.now()), available_stocks, low_stock_alert, status, item_cost * available_stocks, notes),
                 )
                 st.success("Supply saved.")
+                st.rerun()
 
         st.markdown("---")
         df = pd.read_sql_query("SELECT * FROM supplies ORDER BY item_description", conn)
@@ -589,6 +640,7 @@ if page == "Sales Reports":
             """,
             conn,
         )
+        exp = pd.read_sql_query("SELECT * FROM expenses", conn)
 
     if sales.empty:
         st.info("No sales data yet.")
@@ -626,15 +678,10 @@ if page == "Sales Reports":
         st.subheader("Trends")
         import matplotlib.pyplot as plt
 
-        with db.get_conn() as conn:
-            exp = pd.read_sql_query("SELECT * FROM expenses", conn)
-
+        exp = exp.copy()
         exp["m"] = exp["purchase_date"].str.slice(0, 7) if not exp.empty else pd.Series(dtype=str)
-        g_exp_m = (
-            exp.groupby("m", as_index=False)["total_cost"].sum()
-            if not exp.empty
-            else pd.DataFrame(columns=["m", "total_cost"])
-        )
+        g_exp_m = (exp.groupby("m", as_index=False)["total_cost"].sum() if not exp.empty
+                   else pd.DataFrame(columns=["m", "total_cost"]))
 
         fig1 = plt.figure()
         plt.plot(g_month["m"], g_month["total_amount"], label="Sales")
@@ -649,11 +696,8 @@ if page == "Sales Reports":
         st.pyplot(fig1, use_container_width=True)
 
         exp["d"] = exp["purchase_date"].str.slice(0, 10) if not exp.empty else pd.Series(dtype=str)
-        g_exp_d = (
-            exp.groupby("d", as_index=False)["total_cost"].sum()
-            if not exp.empty
-            else pd.DataFrame(columns=["d", "total_cost"])
-        )
+        g_exp_d = (exp.groupby("d", as_index=False)["total_cost"].sum() if not exp.empty
+                   else pd.DataFrame(columns=["d", "total_cost"]))
 
         fig2 = plt.figure()
         plt.plot(g_daily["d"], g_daily["total_amount"], label="Sales")
@@ -681,11 +725,17 @@ if page == "Expense Reports":
         cats = exp.groupby("category", as_index=False)["total_cost"].sum().sort_values("total_cost", ascending=False)
         st.dataframe(cats, use_container_width=True)
         st.subheader("Daily Expense Trend")
-        exp["d"] = exp["purchase_date"].str.slice(0, 10); g_d = exp.groupby("d", as_index=False)["total_cost"].sum(); st.dataframe(g_d, use_container_width=True)
+        exp["d"] = exp["purchase_date"].str.slice(0, 10)
+        g_d = exp.groupby("d", as_index=False)["total_cost"].sum()
+        st.dataframe(g_d, use_container_width=True)
         st.subheader("Monthly Expense Breakdown")
-        exp["m"] = exp["purchase_date"].str.slice(0, 7); g_m = exp.groupby("m", as_index=False)["total_cost"].sum(); st.dataframe(g_m, use_container_width=True)
+        exp["m"] = exp["purchase_date"].str.slice(0, 7)
+        g_m = exp.groupby("m", as_index=False)["total_cost"].sum()
+        st.dataframe(g_m, use_container_width=True)
         st.subheader("Yearly Expense Breakdown")
-        exp["y"] = exp["purchase_date"].str.slice(0, 4); g_y = exp.groupby("y", as_index=False)["total_cost"].sum(); st.dataframe(g_y, use_container_width=True)
+        exp["y"] = exp["purchase_date"].str.slice(0, 4)
+        g_y = exp.groupby("y", as_index=False)["total_cost"].sum()
+        st.dataframe(g_y, use_container_width=True)
 
 # -------------------- Targets --------------------
 if page == "Targets":
@@ -704,6 +754,7 @@ if page == "Targets":
                     (period, sales_target, expense_target, profit_target, notes),
                 )
                 st.success("Target saved.")
+                st.rerun()
 
     st.markdown("---")
     with db.get_conn() as conn:
@@ -720,7 +771,7 @@ if page == "Financial Statements":
     rev = sales["total_amount"].sum() if not sales.empty else 0.0
     vat_collected = sales["vat_amount"].sum() if not sales.empty else 0.0
     net_sales = sales["net_of_vat"].sum() if not sales.empty else 0.0
-    cogs = 0.0
+    cogs = 0.0  # placeholder
     gross_profit = net_sales - cogs
     opex = exp["total_cost"].sum() if not exp.empty else 0.0
     operating_income = gross_profit - opex
@@ -752,13 +803,14 @@ if page == "Shareholders":
             if submitted:
                 conn.execute("INSERT INTO shareholders (name, ownership_pct, notes) VALUES (?,?,?)", (name, pct, notes))
                 st.success("Shareholder saved.")
+                st.rerun()
 
     st.markdown("---")
     with db.get_conn() as conn:
         df = pd.read_sql_query("SELECT * FROM shareholders ORDER BY ownership_pct DESC", conn)
     st.dataframe(df, use_container_width=True)
 
-# -------------------- Profile (password change request) --------------------
+# -------------------- Profile --------------------
 if page == "Profile":
     st.title("👤 Profile")
     u = current_user()
@@ -957,68 +1009,74 @@ if page == "Settings / Import":
 
                     conn.commit()
                 st.success(f"Import complete. Inserted: {ins}, Updated: {upd}")
+                st.rerun()
 
         except Exception as e:
             st.error(f"Import failed: {e}")
 
     st.markdown("---")
     st.caption("Database download / reset")
-    db_file = os.environ.get("TAKEOUT_DB_PATH", "takeout.db")
-    if os.path.exists(db_file):
-        with open(db_file, "rb") as f:
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "rb") as f:
             st.download_button(
                 "Download Database (SQLite)",
                 f,
-                file_name=os.path.basename(db_file),
+                file_name=os.path.basename(DB_FILE),
                 mime="application/octet-stream",
             )
     st.markdown("> Tip: Back up your DB before importing. You can reset by deleting `takeout.db` and restarting the app.")
 
-    st.markdown("## ☁️ Google Drive Backup / Restore")
+    # --------- Google Drive Backup / Restore / Sync (only if configured) ---------
+    if has_drive_secrets():
+        from modules import gdrive, sync
+        folder_id = st.secrets["gdrive"]["folder_id"]
 
-folder_id = st.secrets["gdrive"]["folder_id"]
-db_file = os.environ.get("TAKEOUT_DB_PATH", "takeout.db")
+        st.markdown("## ☁️ Google Drive Backup / Restore")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Backup SQLite DB → Google Drive"):
+                try:
+                    fid = gdrive.upload_file(DB_FILE, folder_id)
+                    st.success(f"DB uploaded to Drive (file id: {fid})")
+                except Exception as e:
+                    st.error(f"Backup failed: {e}")
 
-c1, c2 = st.columns(2)
-with c1:
-    if st.button("Backup SQLite DB → Google Drive"):
-        try:
-            fid = gdrive.upload_file(db_file, folder_id)
-            st.success(f"DB uploaded to Drive (file id: {fid})")
-        except Exception as e:
-            st.error(f"Backup failed: {e}")
-
-with c2:
-    st.caption("List files in Drive folder")
-    try:
-        files = gdrive.list_files(folder_id)
-        import pandas as pd
-        st.dataframe(pd.DataFrame(files), use_container_width=True)
-    except Exception as e:
-        st.error(f"List failed: {e}")
-
-st.markdown("### Restore DB from Drive")
-try:
-    files = gdrive.list_files(folder_id)
-    db_candidates = [f for f in files if f["name"].endswith(".db")]
-    restore_label = st.selectbox(
-        "Pick a .db file from Drive to restore",
-        options=[f'{f["name"]}  ({f["id"]})' for f in db_candidates] or ["— none —"],
-    )
-    if restore_label != "— none —":
-        chosen = db_candidates[[f'{f["name"]}  ({f["id"]})' for f in db_candidates].index(restore_label)]
-        if st.button("Restore selected DB"):
-            tmp_path = os.path.join("tmp_restore.db")
-            gdrive.download_file(chosen["id"], tmp_path)
-            # Safety: move current DB aside, then replace
-            backup_local = db_file + ".pre-restore.bak"
+        with c2:
+            st.caption("List files in Drive folder")
             try:
-                if os.path.exists(db_file):
-                    os.replace(db_file, backup_local)
-                os.replace(tmp_path, db_file)
-                st.success("Restore complete. Please restart the app.")
+                files = gdrive.list_files(folder_id)
+                st.dataframe(pd.DataFrame(files), use_container_width=True)
             except Exception as e:
-                st.error(f"Restore failed: {e}")
-except Exception as e:
-    st.error(f"Restore UI error: {e}")
+                st.error(f"List failed: {e}")
 
+        st.markdown("### Restore DB from Drive")
+        try:
+            files = gdrive.list_files(folder_id)
+            db_candidates = [f for f in files if f["name"].endswith(".db")]
+            labels = [f'{f["name"]}  ({f["id"]})' for f in db_candidates]
+            restore_label = st.selectbox("Pick a .db file from Drive to restore", options=(labels or ["— none —"]))
+            if labels and st.button("Restore selected DB"):
+                chosen = db_candidates[labels.index(restore_label)]
+                tmp_path = os.path.join("tmp_restore.db")
+                gdrive.download_file(chosen["id"], tmp_path)
+                backup_local = DB_FILE + ".pre-restore.bak"
+                try:
+                    if os.path.exists(DB_FILE):
+                        os.replace(DB_FILE, backup_local)
+                    os.replace(tmp_path, DB_FILE)
+                    st.success("Restore complete. Please restart the app.")
+                except Exception as e:
+                    st.error(f"Restore failed: {e}")
+        except Exception as e:
+            st.error(f"Restore UI error: {e}")
+
+        st.markdown("## 🔄 Database Sync with Google Drive")
+        if st.button("Sync now (newest wins)"):
+            try:
+                res = sync.newest_wins_sync(DB_FILE, folder_id)
+                st.success(f"Sync: {res['action']} {('— ' + res.get('why','')) if res.get('why') else ''}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
+    else:
+        st.info("Google Drive not configured. Add `.streamlit/secrets.toml` to enable Drive features.")
