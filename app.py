@@ -8,6 +8,8 @@ from modules.utils import compute_profit_metrics, compute_vat, peso, ymd
 from modules import invoice as inv
 from modules import auth  # NEW
 
+from modules import gdrive
+
 st.set_page_config(page_title="TakeOut Restaurant Management System", layout="wide")
 
 # Init DB (+ ensure admin)
@@ -506,6 +508,12 @@ if page == "Sales & Invoicing":
         os.makedirs(out_dir, exist_ok=True)
         file_path = os.path.join(out_dir, f"{invoice_no}.html")
         inv.save_invoice_html(file_path, html)
+        try:
+            fid = gdrive.upload_file(file_path, st.secrets["gdrive"]["folder_id"])
+            st.info(f"Invoice uploaded to Drive (file id: {fid})")
+        except Exception as e:
+            st.warning(f"Drive upload skipped: {e}")
+                
         st.success(f"Invoice generated: {file_path}")
         with open(file_path, "rb") as f:
             st.download_button("Download Invoice HTML", f, file_name=f"{invoice_no}.html", mime="text/html")
@@ -965,3 +973,52 @@ if page == "Settings / Import":
                 mime="application/octet-stream",
             )
     st.markdown("> Tip: Back up your DB before importing. You can reset by deleting `takeout.db` and restarting the app.")
+
+    st.markdown("## ☁️ Google Drive Backup / Restore")
+
+folder_id = st.secrets["gdrive"]["folder_id"]
+db_file = os.environ.get("TAKEOUT_DB_PATH", "takeout.db")
+
+c1, c2 = st.columns(2)
+with c1:
+    if st.button("Backup SQLite DB → Google Drive"):
+        try:
+            fid = gdrive.upload_file(db_file, folder_id)
+            st.success(f"DB uploaded to Drive (file id: {fid})")
+        except Exception as e:
+            st.error(f"Backup failed: {e}")
+
+with c2:
+    st.caption("List files in Drive folder")
+    try:
+        files = gdrive.list_files(folder_id)
+        import pandas as pd
+        st.dataframe(pd.DataFrame(files), use_container_width=True)
+    except Exception as e:
+        st.error(f"List failed: {e}")
+
+st.markdown("### Restore DB from Drive")
+try:
+    files = gdrive.list_files(folder_id)
+    db_candidates = [f for f in files if f["name"].endswith(".db")]
+    restore_label = st.selectbox(
+        "Pick a .db file from Drive to restore",
+        options=[f'{f["name"]}  ({f["id"]})' for f in db_candidates] or ["— none —"],
+    )
+    if restore_label != "— none —":
+        chosen = db_candidates[[f'{f["name"]}  ({f["id"]})' for f in db_candidates].index(restore_label)]
+        if st.button("Restore selected DB"):
+            tmp_path = os.path.join("tmp_restore.db")
+            gdrive.download_file(chosen["id"], tmp_path)
+            # Safety: move current DB aside, then replace
+            backup_local = db_file + ".pre-restore.bak"
+            try:
+                if os.path.exists(db_file):
+                    os.replace(db_file, backup_local)
+                os.replace(tmp_path, db_file)
+                st.success("Restore complete. Please restart the app.")
+            except Exception as e:
+                st.error(f"Restore failed: {e}")
+except Exception as e:
+    st.error(f"Restore UI error: {e}")
+
